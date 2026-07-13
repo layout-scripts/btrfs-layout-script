@@ -1,6 +1,6 @@
 # btrfs-layout-script
 
-`setup-btrfs.sh` ayuda a convertir un **servidor Debian recién instalado con una única partición root en Btrfs** en un sistema con una estructura clara de subvolúmenes, listo para Timeshift y cargas de trabajo con contenedores.
+`setup-btrfs.sh` ayuda a convertir un **servidor Debian, Ubuntu u otra distribución basada en Debian con una única partición root en Btrfs** en un sistema con una estructura clara de subvolúmenes, listo para Timeshift y cargas de trabajo con contenedores. Funciona tanto para el cambio único en una instalación nueva como, después, en un sistema ya en marcha y migrado, para añadir los subvolúmenes que aún falten (sin necesidad de reiniciar).
 
 ## Idiomas
 
