@@ -319,9 +319,34 @@ done
 rsync -axHAX --delete "${RSYNC_ROOT_EXCLUDES[@]}" / "$MNT/@"
 
 # --- Mountpoints im neuen Root (@) leeren, damit Subvolumes dort einhängen können ---
+# Verschachtelte Faelle (z.B. @containers-volumes wird unter
+# /var/lib/containers/storage/volumes eingehaengt, also INNERHALB von
+# @containers) brauchen den Platzhalter im Eltern-Subvolume, nicht in @ -
+# sonst fehlt das Mount-Zielverzeichnis nach dem Einhaengen des Elternteils.
+parent_info_for() {
+  # Gibt "SUBVOL:RELATIVER_PFAD" zurueck, z.B. "@containers:/storage/volumes"
+  # oder "@:/var/lib/containers", wenn kein Elternteil in MAPS gefunden wird.
+  local target="$1"
+  local best_prefix="" best_subvol="@"
+  local entry src sub
+  for entry in "${MAPS[@]}"; do
+    src="${entry%%:*}"
+    sub="${entry##*:}"
+    if [[ "$src" != "$target" && "$target" == "$src"/* && ${#src} -gt ${#best_prefix} ]]; then
+      best_prefix="$src"
+      best_subvol="$sub"
+    fi
+  done
+  echo "${best_subvol}:${target#"$best_prefix"}"
+}
+
 prepare_mp() {
-  local mp="$1"             # z.B. /home
-  local target="$MNT/@$mp"  # /mnt/btrfs-root/@/home
+  local mp="$1" # z.B. /home oder /var/lib/containers/storage/volumes
+  local info parent_subvol rel target
+  info=$(parent_info_for "$mp")
+  parent_subvol="${info%%:*}"
+  rel="${info#*:}"
+  target="$MNT/$parent_subvol$rel" # z.B. /mnt/btrfs-root/@containers/storage/volumes
   mkdir -p "$target"
   rm -rf "$target"/* 2>/dev/null || true
 }
