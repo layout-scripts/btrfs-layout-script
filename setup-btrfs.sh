@@ -57,6 +57,25 @@ mount -o subvolid=5 "$ROOT_DEV" "$MNT"
 echo ">>> Vorhandene Subvolumes:"
 btrfs subvolume list "$MNT" || true
 
+# --- Speicherplatz-Check ---
+# Jedes Byte auf / wird beim Migrieren einmal dupliziert: entweder landet es
+# (unveraendert) in @, oder es landet zusaetzlich in seinem eigenen Subvolume,
+# waehrend die Originalkopie bis zum Reboot weiter belegt bleibt. Der Gesamt-
+# bedarf entspricht also ungefaehr der aktuell belegten Menge auf /, unabhaengig
+# davon, wie sie sich auf @ und die einzelnen Subvolumes aufteilt.
+echo ">>> Prüfe verfügbaren Speicherplatz"
+USED_BYTES=$(df --output=used -B1 / | tail -1 | tr -d '[:space:]')
+AVAIL_BYTES=$(df --output=avail -B1 / | tail -1 | tr -d '[:space:]')
+REQUIRED_WITH_MARGIN=$(( USED_BYTES * 110 / 100 ))
+if (( AVAIL_BYTES < REQUIRED_WITH_MARGIN )); then
+  echo "FEHLER: Nicht genug freier Speicherplatz für die Migration." >&2
+  echo "Benötigt (mit 10% Marge): ca. $(( REQUIRED_WITH_MARGIN / 1024 / 1024 )) MiB, verfügbar: $(( AVAIL_BYTES / 1024 / 1024 )) MiB." >&2
+  echo "Grund: Während der Migration existieren alle Daten kurzzeitig doppelt (altes flaches Volume + neue Subvolumes)." >&2
+  umount "$MNT"
+  exit 1
+fi
+echo ">>> Speicherplatz-Check bestanden (${AVAIL_BYTES} Bytes frei, ca. ${REQUIRED_WITH_MARGIN} Bytes benötigt)."
+
 create_subvol() {
   local name="$1"
   if btrfs subvolume list "$MNT" | awk '{print $NF}' | grep -qx "$name"; then
@@ -67,12 +86,9 @@ create_subvol() {
   fi
 }
 
-# --- alle Subvolumes anlegen (Root @ wird später befüllt) ---
-for name in @ @root @home @spool @log @cache @tmp_var @srv @tmp @opt @containers @docker @www; do
-  create_subvol "$name"
-done
-
-# --- Mapping Quelle -> Subvolume (für Daten) ---
+# --- Mapping Quelle -> Subvolume (für Daten); einzige Quelle der Wahrheit für
+# Subvolume-Namen, Rsync-Ausschlüsse, Mountpoint-Vorbereitung, -Erzeugung und
+# fstab-Einträge (siehe SUBVOL_OPTS weiter unten) ---
 declare -a MAPS=(
 "/root:@root"
 "/home:@home"
@@ -85,12 +101,89 @@ declare -a MAPS=(
 "/opt:@opt"
 "/var/lib/containers:@containers"
 "/var/lib/docker:@docker"
+"/var/lib/mongodb:@mongodb"
+"/var/lib/mysql:@mysql"
+"/var/lib/postgresql:@postgresql"
 "/var/www:@www"
+# Feste, versionsunabhaengige Pfade fuer benannte Volumes von Docker/Podman
+# (getrennt von @docker/@containers, damit Volume-Daten nodatacow bekommen,
+# waehrend Image-Layer/Metadaten weiterhin von compress=zstd profitieren).
+"/var/lib/docker/volumes:@docker-volumes"
+"/var/lib/containers/storage/volumes:@containers-volumes"
 )
+
+# Mount-Optionen je Subvolume (Datenbanken/Container-Volumes: nodatacow statt
+# compress/autodefrag, da Copy-on-Write und Kompression sich schlecht mit
+# Random-Write-Mustern vertragen).
+declare -A SUBVOL_OPTS=(
+  [@root]="noatime,compress=zstd,space_cache=v2"
+  [@home]="noatime,compress=zstd,space_cache=v2,autodefrag"
+  [@spool]="noatime,compress=zstd,space_cache=v2,autodefrag"
+  [@log]="noatime,compress=zstd,space_cache=v2,autodefrag"
+  [@cache]="noatime,compress=zstd,space_cache=v2"
+  [@tmp_var]="noatime,compress=zstd,space_cache=v2"
+  [@srv]="noatime,compress=zstd,space_cache=v2"
+  [@tmp]="noatime,compress=zstd,space_cache=v2"
+  [@opt]="noatime,compress=zstd,space_cache=v2"
+  [@containers]="noatime,compress=zstd,space_cache=v2"
+  [@docker]="noatime,compress=zstd,space_cache=v2"
+  [@www]="noatime,compress=zstd,space_cache=v2"
+  [@mongodb]="noatime,nodatacow,space_cache=v2"
+  [@mysql]="noatime,nodatacow,space_cache=v2"
+  [@postgresql]="noatime,nodatacow,space_cache=v2"
+  [@docker-volumes]="noatime,nodatacow,space_cache=v2"
+  [@containers-volumes]="noatime,nodatacow,space_cache=v2"
+)
+
+# --- Interaktive Auswahl: welche Subvolumes sollen angelegt werden? ---
+# Alle sind vorausgewählt. Abgewählte Pfade bekommen kein eigenes Subvolume
+# und bleiben einfach Teil von @ (Root) - das Skript braucht dafür keine
+# Sonderbehandlung, da alles Weitere aus MAPS abgeleitet wird.
+echo ">>> Geplante Subvolumes:"
+for entry in "${MAPS[@]}"; do
+  echo "    ${entry%%:*} -> ${entry##*:}"
+done
+
+if [[ -t 0 && -t 1 ]]; then
+  need_pkg whiptail whiptail
+  CHECKLIST_ARGS=()
+  for entry in "${MAPS[@]}"; do
+    CHECKLIST_ARGS+=("${entry##*:}" "${entry%%:*}" "ON")
+  done
+  SELECTED=$(whiptail --title "Btrfs-Subvolumes auswählen" \
+    --checklist "Alle Subvolumes sind vorausgewählt. Leertaste = ab-/anwählen, Enter = bestätigen.\nAbgewählte Pfade bleiben einfach Teil von @ (Root)." \
+    24 78 14 \
+    "${CHECKLIST_ARGS[@]}" \
+    3>&1 1>&2 2>&3) || { echo "Abgebrochen." >&2; umount "$MNT"; exit 1; }
+  eval "SELECTED_ARR=($SELECTED)"
+
+  FILTERED_MAPS=()
+  for entry in "${MAPS[@]}"; do
+    sub="${entry##*:}"
+    for sel in "${SELECTED_ARR[@]}"; do
+      if [[ "$sub" == "$sel" ]]; then
+        FILTERED_MAPS+=("$entry")
+        break
+      fi
+    done
+  done
+  MAPS=("${FILTERED_MAPS[@]}")
+  echo ">>> Ausgewählt: ${#MAPS[@]} Subvolumes."
+else
+  echo ">>> Kein interaktives Terminal erkannt - alle Subvolumes werden angelegt (kein Auswahldialog)."
+fi
+
+# --- alle Subvolumes anlegen (Root @ wird später befüllt) ---
+create_subvol "@"
+for entry in "${MAPS[@]}"; do
+  create_subvol "${entry##*:}"
+done
 
 sync_dir() {
   local src="$1"    # z.B. /home
   local subvol="$2" # z.B. @home
+  shift 2
+  local extra_excludes=("$@") # z.B. --exclude=/volumes/* fuer verschachtelte Subvolumes
 
   if [[ ! -d "$src" ]]; then
     echo "Quelle $src existiert nicht, überspringe."
@@ -98,14 +191,51 @@ sync_dir() {
   fi
 
   echo ">>> Übertrage $src nach $subvol (überschreibend)"
-  rsync -axHAX --delete "$src"/ "$MNT/$subvol"/
+  rsync -axHAX --delete "${extra_excludes[@]}" "$src"/ "$MNT/$subvol"/
 }
+
+# --- Bekannte Dienste vor der Kopie stoppen (konsistente Daten statt
+# halbgeschriebener Dateien bei aktiv laufenden Datenbanken/Containern) ---
+declare -A SRC_SERVICE=(
+  ["/var/lib/mongodb"]="mongod"
+  ["/var/lib/mysql"]="mysql"
+  ["/var/lib/postgresql"]="postgresql"
+  ["/var/lib/docker"]="docker"
+  ["/var/lib/docker/volumes"]="docker"
+)
+declare -a STOPPED_SERVICES=()
+declare -A ALREADY_HANDLED=()
+
+for entry in "${MAPS[@]}"; do
+  src="${entry%%:*}"
+  svc="${SRC_SERVICE[$src]:-}"
+  if [[ -n "$svc" && -z "${ALREADY_HANDLED[$svc]:-}" ]]; then
+    ALREADY_HANDLED[$svc]=1
+    if systemctl is-active --quiet "$svc" 2>/dev/null; then
+      echo ">>> Stoppe $svc für eine konsistente Kopie"
+      systemctl stop "$svc"
+      STOPPED_SERVICES+=("$svc")
+    fi
+  fi
+done
 
 echo ">>> Übertrage /root, /home, /var/... in ihre Subvolumes"
 for entry in "${MAPS[@]}"; do
   src="${entry%%:*}"
   sub="${entry##*:}"
-  sync_dir "$src" "$sub"
+  # /var/lib/docker/volumes und /var/lib/containers/storage/volumes bekommen
+  # weiter unten ihr eigenes Subvolume - hier von der jeweiligen Elternkopie
+  # ausschliessen, sonst landen sie doppelt (einmal hier, einmal separat).
+  case "$src" in
+    /var/lib/docker) sync_dir "$src" "$sub" --exclude=/volumes/* ;;
+    /var/lib/containers) sync_dir "$src" "$sub" --exclude=/storage/volumes/* ;;
+    *) sync_dir "$src" "$sub" ;;
+  esac
+done
+
+for svc in "${STOPPED_SERVICES[@]}"; do
+  echo ">>> Starte $svc wieder"
+  systemctl start "$svc" || echo "WARNUNG: $svc konnte nicht neu gestartet werden – bitte manuell prüfen." >&2
 done
 
 # --- fstab im laufenden System anpassen ---
@@ -136,24 +266,15 @@ add_fstab_entry() {
   fi
 }
 
-
-
 # Root mit subvol=@
 add_fstab_entry / @ "noatime,compress=zstd,space_cache=v2" 1
 
-# weitere Mounts (pass=2)
-add_fstab_entry /root @root "noatime,compress=zstd,space_cache=v2" 2
-add_fstab_entry /home @home "noatime,compress=zstd,space_cache=v2,autodefrag" 2
-add_fstab_entry /var/spool @spool "noatime,compress=zstd,space_cache=v2,autodefrag" 2
-add_fstab_entry /var/log @log "noatime,compress=zstd,space_cache=v2,autodefrag" 2
-add_fstab_entry /var/cache @cache "noatime,compress=zstd,space_cache=v2" 2
-add_fstab_entry /var/tmp @tmp_var "noatime,compress=zstd,space_cache=v2" 2
-add_fstab_entry /srv @srv "noatime,compress=zstd,space_cache=v2" 2
-add_fstab_entry /tmp @tmp "noatime,compress=zstd,space_cache=v2" 2
-add_fstab_entry /opt @opt "noatime,compress=zstd,space_cache=v2" 2
-add_fstab_entry /var/lib/containers @containers "noatime,compress=zstd,space_cache=v2" 2
-add_fstab_entry /var/lib/docker @docker "noatime,compress=zstd,space_cache=v2" 2
-add_fstab_entry /var/www @www "noatime,compress=zstd,space_cache=v2" 2
+# weitere Mounts (pass=2), Optionen aus SUBVOL_OPTS
+for entry in "${MAPS[@]}"; do
+  src="${entry%%:*}"
+  sub="${entry##*:}"
+  add_fstab_entry "$src" "$sub" "${SUBVOL_OPTS[$sub]}" 2
+done
 
 # --- GRUB-Konfiguration im laufenden System anpassen ---
 if [[ -f /etc/default/grub ]]; then
@@ -178,18 +299,24 @@ else
 fi
 
 # --- Root nach @ kopieren (JETZT, damit neue fstab & grub darin landen) ---
+# Verzeichnisse, die ihr eigenes Subvolume bekommen, hier ausschliessen: sie
+# wurden oben bereits per sync_dir befuellt und wuerden sonst redundant
+# kopiert und per prepare_mp sofort wieder geloescht.
 echo ">>> Kopiere aktuelles Root-Dateisystem nach @ (überschreibend)"
-rsync -axHAX --delete \
-  --exclude="$MNT/*" \
-  --exclude="/dev/*" \
-  --exclude="/proc/*" \
-  --exclude="/sys/*" \
-  --exclude="/run/*" \
-  --exclude="/tmp/*" \
-  --exclude="/mnt/*" \
-  --exclude="/media/*" \
-  --exclude="/lost+found" \
-  / "$MNT/@"
+RSYNC_ROOT_EXCLUDES=(
+  --exclude="$MNT/*"
+  --exclude="/dev/*"
+  --exclude="/proc/*"
+  --exclude="/sys/*"
+  --exclude="/run/*"
+  --exclude="/mnt/*"
+  --exclude="/media/*"
+  --exclude="/lost+found"
+)
+for entry in "${MAPS[@]}"; do
+  RSYNC_ROOT_EXCLUDES+=(--exclude="${entry%%:*}/*")
+done
+rsync -axHAX --delete "${RSYNC_ROOT_EXCLUDES[@]}" / "$MNT/@"
 
 # --- Mountpoints im neuen Root (@) leeren, damit Subvolumes dort einhängen können ---
 prepare_mp() {
@@ -200,8 +327,8 @@ prepare_mp() {
 }
 
 echo ">>> Mountpoints im neuen Root (@) vorbereiten"
-for mp in /root /home /var/spool /var/log /var/cache /var/tmp /srv /tmp /opt /var/lib/containers /var/lib/docker /var/www; do
-  prepare_mp "$mp"
+for entry in "${MAPS[@]}"; do
+  prepare_mp "${entry%%:*}"
 done
 
 # --- Default-Subvolume auf @ setzen ---
@@ -223,12 +350,21 @@ fi
 set -e
 
 echo ">>> Erzeuge Mountpoints im laufenden System (falls noch nicht vorhanden)"
-mkdir -p /root /home /srv /opt /tmp
-mkdir -p /var/spool /var/log /var/cache /var/tmp
-mkdir -p /var/lib/containers /var/lib/docker
-mkdir -p /var/www
+for entry in "${MAPS[@]}"; do
+  mkdir -p "${entry%%:*}"
+done
 
 umount "$MNT"
+
+# --- fstab validieren, ohne live umzumounten (kein Eingriff in laufende Dienste) ---
+echo ">>> Validiere neue fstab mit 'findmnt --verify'"
+if ! findmnt --verify; then
+  echo "FEHLER: 'findmnt --verify' hat Probleme in der neuen fstab gefunden." >&2
+  echo "Bitte ${FSTAB} pruefen, bevor du 'mount -a' ausfuehrst oder neu startest." >&2
+  echo "Die alte fstab liegt gesichert unter ${backup}." >&2
+  exit 1
+fi
+echo ">>> fstab-Validierung bestanden."
 
 echo
 echo ">>> FERTIG."

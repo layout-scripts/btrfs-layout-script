@@ -14,6 +14,9 @@ On a Debian (or Debian-based) system with a Btrfs root filesystem, the script:
 
 - Detects the current root device via `findmnt` (e.g. `/dev/vda2[/@rootfs]` → `/dev/vda2`).
 - Mounts the Btrfs top-level (`subvolid=5`) under `/mnt/btrfs-root`.
+- Checks available disk space upfront (every byte on `/` is briefly duplicated during migration) and aborts if it's too tight.
+- Shows an interactive selection dialog (`whiptail`) when run in a terminal: all subvolumes are pre-selected, you can deselect individual ones — deselected paths simply stay part of `@` without their own subvolume. Without an interactive terminal (e.g. automated runs), all subvolumes are created without prompting.
+- Stops known services (`mongod`, `mysql`, `postgresql`, `docker`) before copying their data if they're currently running, and restarts them afterwards — for a consistent copy instead of half-written files.
 - Creates the following subvolumes (idempotent; if they already exist, they are reused):
 
   - `@` (new root)
@@ -28,9 +31,14 @@ On a Debian (or Debian-based) system with a Btrfs root filesystem, the script:
   - `@opt`
   - `@containers`
   - `@docker`
+  - `@mongodb`
+  - `@mysql`
+  - `@postgresql`
+  - `@docker-volumes`
+  - `@containers-volumes`
   - `@www`
 
-- Copies the current root filesystem to `@` (with sane exclusions like `/dev`, `/proc`, `/sys`, `/run`, `/tmp`, `/mnt`, `/media`, …).
+- Copies the current root filesystem to `@` (excluding `/dev`, `/proc`, `/sys`, `/run`, `/mnt`, `/media`, `/lost+found`, plus — derived automatically from the mapping below — every path that gets its own subvolume).
 - Copies the content of these directories into their matching subvolumes:
 
   - `/root` → `@root`
@@ -44,7 +52,14 @@ On a Debian (or Debian-based) system with a Btrfs root filesystem, the script:
   - `/opt` → `@opt`
   - `/var/lib/containers` → `@containers`
   - `/var/lib/docker` → `@docker`
+  - `/var/lib/mongodb` → `@mongodb`
+  - `/var/lib/mysql` → `@mysql`
+  - `/var/lib/postgresql` → `@postgresql`
+  - `/var/lib/docker/volumes` → `@docker-volumes`
+  - `/var/lib/containers/storage/volumes` → `@containers-volumes`
   - `/var/www` → `@www`
+
+  Database subvolumes (`@mongodb`, `@mysql`, `@postgresql`) as well as named Docker/Podman volumes (`@docker-volumes`, `@containers-volumes`) are mounted with `nodatacow` instead of `compress=zstd`/`autodefrag` — copy-on-write and compression don't play well with databases' random-write patterns, and volumes can hold arbitrary workloads with the same characteristics. Image layers and metadata in `@docker`/`@containers` themselves are unaffected and stay compressed.
 
 - Prepares empty mountpoints inside the new root (`@`) so that the subvolumes can be mounted there.
 - Updates `/etc/fstab` in the running system:
@@ -60,6 +75,7 @@ On a Debian (or Debian-based) system with a Btrfs root filesystem, the script:
 
 - Sets the Btrfs default subvolume to `@`, so the system boots from `@`.
 - Ensures required mountpoints also exist in the current root (`/home`, `/var/lib/docker`, …).
+- Validates the new `/etc/fstab` automatically with `findmnt --verify` (read-only, doesn't remount anything live) and aborts before you accidentally reboot into a broken fstab.
 
 The end result:
 
