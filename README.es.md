@@ -95,7 +95,9 @@ El script instalará automáticamente, si faltan:
 - `rsync`
 - `btrfs-progs`
 
-> Uso recomendado: en una **instalación nueva de servidor**, donde reorganizar el sistema de ficheros es aceptable. En sistemas ya muy usados, toma precauciones adicionales y asegúrate de tener copias de seguridad.
+> Lo más sencillo es usarlo en una **instalación nueva de servidor**, ya que ahí todos los directorios están vacíos o son pequeños. Pero el script también funciona en sistemas ya en producción, **siempre que haya suficiente espacio libre** (se comprueba automáticamente — cada byte en `/` se duplica brevemente durante la migración). Para una copia consistente, los servicios conocidos (`mongod`, `mysql`, `postgresql`, `docker`) se detienen automáticamente antes de copiar sus datos y se reinician después.
+>
+> Aun así, en un sistema en producción: haz una copia de seguridad antes, planifica una ventana de mantenimiento para el reinicio final, y ten en cuenta que las aplicaciones **fuera** de esta lista (por ejemplo Podman, o un proceso de servidor web propio con archivos abiertos en `/srv` o `/var/www`) siguen funcionando durante la copia y en teoría podrían acabar con una instantánea inconsistente en su subvolumen.
 
 ## Uso
 

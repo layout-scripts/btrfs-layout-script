@@ -95,7 +95,9 @@ Bei Bedarf installiert das Skript automatisch:
 - `rsync`
 - `btrfs-progs`
 
-> Empfohlener Einsatz: auf einer **frischen Server-Installation**, bei der die Neu-Strukturierung des Dateisystems in Ordnung ist. Auf bereits stark genutzten Systemen solltest du besonders sorgfältig testen und ein Backup haben.
+> Am unkompliziertesten auf einer **frischen Server-Installation**, da dort alle Verzeichnisse klein/leer sind. Das Skript funktioniert aber auch auf bereits laufenden Systemen, **sofern genug freier Speicherplatz vorhanden ist** (wird automatisch geprüft – jedes Byte auf `/` wird während der Migration kurzzeitig dupliziert). Für eine konsistente Kopie werden bekannte Dienste (`mongod`, `mysql`, `postgresql`, `docker`) vor ihrer jeweiligen Datenkopie automatisch gestoppt und danach wieder gestartet.
+>
+> Trotzdem gilt auf laufenden Systemen: mach vorher ein Backup, plane ein Wartungsfenster für den abschließenden Neustart ein, und bedenke, dass Anwendungen **außerhalb** dieser Liste (z. B. Podman, ein eigener Webserver-Prozess mit offenen Dateien in `/srv` oder `/var/www`) während der Kopie weiterlaufen und dadurch theoretisch eine inkonsistente Momentaufnahme in ihr Subvolume bekommen könnten.
 
 ## Verwendung
 

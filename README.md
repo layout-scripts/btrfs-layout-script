@@ -95,7 +95,9 @@ The script will install the following packages if missing:
 - `rsync`
 - `btrfs-progs`
 
-> Recommended usage: on a **fresh server installation** where reorganising the filesystem is acceptable. On a heavily used system, take extra care and ensure you have backups.
+> Simplest on a **fresh server installation**, since every directory is small/empty there. The script also works on already-running systems, **provided there's enough free disk space** (checked automatically — every byte on `/` is briefly duplicated during migration). For a consistent copy, known services (`mongod`, `mysql`, `postgresql`, `docker`) are automatically stopped before their respective data copy and restarted afterwards.
+>
+> Still, on a running system: take a backup first, plan a maintenance window for the final reboot, and keep in mind that applications **outside** this list (e.g. Podman, a custom web server process with open files under `/srv` or `/var/www`) keep running during the copy and could in theory end up with an inconsistent snapshot in their subvolume.
 
 ## Usage
 
