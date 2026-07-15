@@ -424,9 +424,11 @@ if [[ $INCREMENTAL -eq 0 ]]; then
   fi
 
   # --- Root nach @ kopieren (JETZT, damit neue fstab & grub darin landen) ---
-  # Verzeichnisse, die ihr eigenes Subvolume bekommen, hier ausschliessen: sie
-  # wurden oben bereits per sync_dir befuellt und wuerden sonst redundant
-  # kopiert und per prepare_mp sofort wieder geloescht.
+  # Verzeichnisse, die wirklich ihr eigenes Subvolume bekommen, hier
+  # ausschliessen: sie wurden oben bereits per sync_dir befuellt und wuerden
+  # sonst redundant kopiert und per prepare_mp sofort wieder geloescht.
+  # Abgewaehlte Kandidaten bleiben dagegen Teil von @ und duerfen nicht aus
+  # dem Root-Rsync ausgeschlossen werden.
   echo ">>> Kopiere aktuelles Root-Dateisystem nach @ (überschreibend)"
   RSYNC_ROOT_EXCLUDES=(
     --exclude="$MNT/*"
@@ -438,7 +440,7 @@ if [[ $INCREMENTAL -eq 0 ]]; then
     --exclude="/media/*"
     --exclude="/lost+found"
   )
-  for entry in "${ALL_MAPS[@]}"; do
+  for entry in "${MAPS[@]}"; do
     RSYNC_ROOT_EXCLUDES+=(--exclude="${entry%%:*}/*")
   done
   rsync -axHAX --delete "${RSYNC_ROOT_EXCLUDES[@]}" / "$MNT/@"
