@@ -11,6 +11,7 @@ fi
 ASSUME_YES=${LAYOUT_SCRIPT_ASSUME_YES:-0}
 TOPLEVEL_MNT=""
 GUARD_SNAPSHOT=""
+APT_UPDATED=0
 
 cleanup() {
   if [[ -n "$TOPLEVEL_MNT" && -d "$TOPLEVEL_MNT" ]]; then
@@ -30,25 +31,41 @@ package_installed() {
 
 need_pkg() {
   local cmd="$1" pkg="$2"
-  if command -v "$cmd" >/dev/null 2>&1 || package_installed "$pkg"; then
-    echo ">>> Abhängigkeit $pkg ist bereits vorhanden."
+  if command -v "$cmd" >/dev/null 2>&1; then
+    echo ">>> Abhängigkeit $pkg ($cmd) ist bereits vorhanden."
     return 0
   fi
 
   echo ">>> Installiere benötigtes Paket: $pkg"
-  apt-get update
+  ensure_apt_updated
   DEBIAN_FRONTEND=noninteractive apt-get install -y "$pkg"
 }
 
+# Sorgt dafuer, dass apt-get update genau einmal pro Skriptlauf ausgefuehrt
+# wird, egal wie oft need_pkg() aufgerufen wird - vermeidet redundante
+# Netzwerk-/Index-Aktualisierungen bei mehreren benoetigten Paketen.
+ensure_apt_updated() {
+  if [[ "$APT_UPDATED" != "1" ]]; then
+    echo ">>> Aktualisiere apt-Paketindex"
+    apt-get update
+    APT_UPDATED=1
+  fi
+}
+
 confirm_or_abort() {
-  if [[ -t 0 ]]; then
+  # ASSUME_YES wird zuerst geprueft: ein explizit gesetztes
+  # LAYOUT_SCRIPT_ASSUME_YES=1 soll die Abfrage auch dann ueberspringen,
+  # wenn stdin ein TTY ist (z.B. ssh -t, docker run -it, manche
+  # Ansible-Konfigurationen) - sonst haengt eine Automatisierung trotz
+  # gesetztem Bypass an der interaktiven Nachfrage fest.
+  if [[ "$ASSUME_YES" == "1" ]]; then
+    echo ">>> LAYOUT_SCRIPT_ASSUME_YES=1 gesetzt, Bestätigung übersprungen."
+  elif [[ -t 0 ]]; then
     read -r -p "Guard-Snapshot erstellen und Snapper einrichten? Exakt 'ja' eingeben: " CONFIRM
     if [[ "$CONFIRM" != "ja" ]]; then
       echo "Abgebrochen." >&2
       exit 1
     fi
-  elif [[ "$ASSUME_YES" == "1" ]]; then
-    echo ">>> Nicht-interaktiver Lauf mit LAYOUT_SCRIPT_ASSUME_YES=1 bestätigt."
   else
     echo "FEHLER: Kein interaktives Terminal. Setze LAYOUT_SCRIPT_ASSUME_YES=1 für automatisierte Läufe." >&2
     exit 1
@@ -104,6 +121,12 @@ echo ">>> Root-Device: ${ROOT_DEV}"
 echo ">>> Root-Subvolume: ${ROOT_SUBVOL}"
 echo ">>> Geplantes Snapshot-Subvolume: ${SNAPSHOTS_SUBVOL}"
 
+# Paketindex jetzt aktualisieren, nicht erst beim ersten need_pkg-Aufruf:
+# auf einem frischen/geleerten apt-Cache waeren die folgenden
+# apt_package_available-Pruefungen sonst faelschlich negativ und wuerden
+# das Skript unnoetig abbrechen lassen.
+ensure_apt_updated
+
 if ! apt_package_available snapper && ! package_installed snapper; then
   echo "FEHLER: Paket 'snapper' ist in den konfigurierten APT-Quellen nicht verfügbar." >&2
   exit 1
@@ -131,7 +154,7 @@ echo
 confirm_or_abort
 
 create_guard_snapshot() {
-  local timestamp src parent base dest
+  local timestamp src parent base dest existing_guards
 
   timestamp=$(date +%F-%H%M%S)
   TOPLEVEL_MNT=$(mktemp -d /mnt/btrfs-toplevel.XXXXXX)
@@ -142,6 +165,16 @@ create_guard_snapshot() {
   if [[ ! -d "$src" ]]; then
     echo "FEHLER: Root-Subvolume wurde unter $src nicht gefunden." >&2
     exit 1
+  fi
+
+  # Guard-Snapshots werden bewusst dauerhaft aufbewahrt (siehe Rollback-
+  # Hinweis am Skriptende) und nie automatisch geloescht - daher hier
+  # zumindest auf bereits vorhandene aus frueheren Laeufen hinweisen, statt
+  # sie stillschweigend unbemerkt weiter anwachsen zu lassen.
+  existing_guards=$(btrfs subvolume list "$TOPLEVEL_MNT" | awk '{print $NF}' | grep -- '\.before-snapper-setup-' || true)
+  if [[ -n "$existing_guards" ]]; then
+    echo ">>> Hinweis: Guard-Snapshot(s) aus früheren Läufen gefunden (werden nicht automatisch gelöscht):"
+    echo "$existing_guards" | sed 's/^/    /'
   fi
 
   parent=$(dirname "$ROOT_SUBVOL")
@@ -162,6 +195,14 @@ create_guard_snapshot() {
   echo ">>> Erzeuge read-only Guard-Snapshot: $GUARD_SNAPSHOT"
   btrfs subvolume snapshot -r "$src" "$dest"
   echo ">>> Guard-Snapshot erstellt: $GUARD_SNAPSHOT"
+
+  # Top-Level-Mount wird nur fuer die Snapshot-Erzeugung selbst benoetigt -
+  # sofort wieder aushaengen statt ihn ueber den kompletten restlichen
+  # Skriptlauf (Paketinstallation, fstab-Aenderung, GRUB-Update) offenzuhalten.
+  echo ">>> Hänge Btrfs-Top-Level wieder aus (nur für den Guard-Snapshot benötigt)"
+  umount "$TOPLEVEL_MNT"
+  rmdir "$TOPLEVEL_MNT"
+  TOPLEVEL_MNT=""
 }
 
 create_guard_snapshot
@@ -187,8 +228,21 @@ restore_fstab_backup() {
   fi
 }
 
-if grep -Eq '^[^#[:space:]]+[[:space:]]+/\.snapshots[[:space:]]+btrfs' "$FSTAB"; then
-  echo ">>> fstab: Eintrag für /.snapshots existiert bereits, überspringe."
+EXISTING_SNAPSHOTS_LINE=$(grep -E '^[^#[:space:]]+[[:space:]]+/\.snapshots[[:space:]]+btrfs' "$FSTAB" || true)
+if [[ -n "$EXISTING_SNAPSHOTS_LINE" ]]; then
+  # Nicht nur pruefen, DASS eine /.snapshots-Zeile existiert, sondern auch,
+  # ob ihr subvol= tatsaechlich zum aktuell berechneten Subvolume passt -
+  # sonst wuerde ein Eintrag aus einem frueheren Lauf (anderes ROOT_SUBVOL)
+  # oder eine manuelle Aenderung stillschweigend uebernommen.
+  EXISTING_SUBVOL=$(echo "$EXISTING_SNAPSHOTS_LINE" | grep -oE 'subvol=[^, ]+' | head -1 | cut -d= -f2)
+  if [[ "$EXISTING_SUBVOL" == "$SNAPSHOTS_SUBVOL" ]]; then
+    echo ">>> fstab: Eintrag für /.snapshots existiert bereits und passt (subvol=${EXISTING_SUBVOL}), überspringe."
+  else
+    echo "FEHLER: /.snapshots hat bereits einen fstab-Eintrag mit abweichendem subvol." >&2
+    echo "Gefunden: '${EXISTING_SUBVOL:-<leer>}', erwartet: '${SNAPSHOTS_SUBVOL}'." >&2
+    echo "Bitte ${FSTAB} manuell prüfen und den vorhandenen Eintrag korrigieren oder entfernen." >&2
+    exit 1
+  fi
 else
   FSTAB_BACKUP="${FSTAB}.backup-$(date +%F-%H%M%S)"
   echo ">>> Sicherung der aktuellen fstab nach $FSTAB_BACKUP"
@@ -197,9 +251,9 @@ else
   echo ">>> fstab: Eintrag für /.snapshots hinzugefügt."
 fi
 
-mkdir -p /.snapshots
+mkdir -p /.snapshots || { echo "FEHLER: Konnte /.snapshots nicht anlegen." >&2; restore_fstab_backup; exit 1; }
 echo ">>> Prüfe und aktiviere den neuen Mount"
-systemctl daemon-reload
+systemctl daemon-reload || { echo "FEHLER: 'systemctl daemon-reload' ist fehlgeschlagen." >&2; restore_fstab_backup; exit 1; }
 if ! findmnt --verify; then
   echo "FEHLER: 'findmnt --verify' hat Probleme in der neuen fstab gefunden." >&2
   restore_fstab_backup
@@ -233,18 +287,30 @@ install_apt_hooks() {
   local post_script="/usr/local/sbin/snapper-apt-post"
   local hook_conf="/etc/apt/apt.conf.d/80snapper"
   local marker="# Managed by layout-scripts/snapper-layout-script"
-  local legacy_pre="DPkg::Pre-Invoke {\"$pre_script\";};"
-  local legacy_post="DPkg::Post-Invoke {\"$post_script\";};"
+  local hook_content
+  hook_content=$(printf '%s\nDPkg::Pre-Invoke {"%s";};\nDPkg::Post-Invoke {"%s";};\n' \
+    "$marker" "$pre_script" "$post_script")
 
-  if [[ -f "$hook_conf" ]] &&
-    ! grep -Fqx "$marker" "$hook_conf" &&
-    ! { grep -Fqx "$legacy_pre" "$hook_conf" && grep -Fqx "$legacy_post" "$hook_conf"; }; then
-    echo "FEHLER: $hook_conf existiert, ist aber nicht von diesem Skript verwaltet." >&2
-    echo "Bitte manuell prüfen oder verschieben, damit keine fremden apt-Hooks überschrieben werden." >&2
-    exit 1
+  # Statt eines starren Marker-ODER-Legacy-Zeilenvergleichs (der schon an
+  # trivialen Formatierungsunterschieden scheitert und im Trefferfall die
+  # Datei trotzdem bedingungslos ueberschrieb) wird der tatsaechliche
+  # Zielinhalt direkt mit dem Ist-Zustand verglichen: identisch -> idempotent
+  # ueberspringen, fremd (kein Marker) -> abbrechen, eigener aber veralteter
+  # Inhalt -> aktualisieren.
+  if [[ -f "$hook_conf" ]]; then
+    if [[ "$(cat "$hook_conf")" == "$hook_content" ]]; then
+      echo ">>> apt-Hooks für snapper sind bereits aktuell ($hook_conf), überspringe."
+      return 0
+    fi
+    if ! grep -Fqx "$marker" "$hook_conf"; then
+      echo "FEHLER: $hook_conf existiert, ist aber nicht von diesem Skript verwaltet." >&2
+      echo "Bitte manuell prüfen oder verschieben, damit keine fremden apt-Hooks überschrieben werden." >&2
+      exit 1
+    fi
+    echo ">>> apt-Hooks für snapper sind veraltet, aktualisiere $hook_conf"
+  else
+    echo ">>> Installiere apt-Hooks für Pre-/Post-Snapshots: $pre_script, $post_script, $hook_conf"
   fi
-
-  echo ">>> Installiere/aktualisiere apt-Hooks für Pre-/Post-Snapshots"
 
   cat > "$pre_script" <<'EOF'
 #!/usr/bin/env bash
@@ -283,11 +349,7 @@ exit 0
 EOF
   chmod 755 "$post_script"
 
-  cat > "$hook_conf" <<EOF
-$marker
-DPkg::Pre-Invoke {"$pre_script";};
-DPkg::Post-Invoke {"$post_script";};
-EOF
+  printf '%s' "$hook_content" > "$hook_conf"
 }
 
 install_apt_hooks
