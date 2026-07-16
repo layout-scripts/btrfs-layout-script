@@ -127,6 +127,7 @@ declare -a ALL_MAPS=(
 "/var/lib/mysql:@mysql"
 "/var/lib/postgresql:@postgresql"
 "/var/lib/chroma:@chroma"
+"/var/lib/clamav:@clamav"
 "/var/lib/stalwart:@stalwart"
 "/var/lib/elasticsearch:@elasticsearch"
 "/var/lib/opensearch:@opensearch"
@@ -165,6 +166,7 @@ declare -A SUBVOL_OPTS=(
   [@mysql]="noatime,compress=zstd,space_cache=v2"
   [@postgresql]="noatime,compress=zstd,space_cache=v2"
   [@chroma]="noatime,compress=zstd,space_cache=v2"
+  [@clamav]="noatime,compress=zstd,space_cache=v2"
   [@stalwart]="noatime,compress=zstd,space_cache=v2"
   [@elasticsearch]="noatime,compress=zstd,space_cache=v2"
   [@opensearch]="noatime,compress=zstd,space_cache=v2"
@@ -185,6 +187,7 @@ declare -A NO_COMPRESSION_SUBVOLS=(
   [@mysql]=1
   [@postgresql]=1
   [@chroma]=1
+  [@clamav]=1
   [@stalwart]=1
   [@elasticsearch]=1
   [@opensearch]=1
@@ -398,6 +401,7 @@ declare -A SRC_SERVICE=(
   ["/var/lib/mysql"]="mariadb mysql"
   ["/var/lib/postgresql"]="postgresql"
   ["/var/lib/chroma"]="chroma chromadb"
+  ["/var/lib/clamav"]="clamav-freshclam clamav-freshclam-once.timer clamav-daemon"
   ["/var/lib/stalwart"]="stalwart-mail stalwart stalwart-server"
   ["/var/lib/elasticsearch"]="elasticsearch"
   ["/var/lib/opensearch"]="opensearch"
@@ -408,9 +412,20 @@ declare -A SRC_SERVICE=(
   ["/var/lib/rabbitmq"]="rabbitmq-server rabbitmq"
   ["/var/lib/docker"]="docker"
   ["/var/lib/docker/volumes"]="docker"
+  ["/var/lib/containers"]="podman podman.socket podman-restart crio containerd"
+  ["/var/lib/containers/storage/volumes"]="podman podman.socket podman-restart crio containerd"
 )
 declare -a STOPPED_SERVICES=()
 declare -A ALREADY_HANDLED=()
+
+restart_stopped_services() {
+  local svc
+  for svc in "${STOPPED_SERVICES[@]}"; do
+    echo ">>> Starte $svc wieder"
+    systemctl start "$svc" || echo "WARNUNG: $svc konnte nicht neu gestartet werden – bitte manuell prüfen." >&2
+  done
+  STOPPED_SERVICES=()
+}
 
 for entry in "${MAPS[@]}"; do
   src="${entry%%:*}"
@@ -438,11 +453,6 @@ for entry in "${MAPS[@]}"; do
     /var/lib/containers) sync_dir "$src" "$sub" --exclude=/storage/volumes/* ;;
     *) sync_dir "$src" "$sub" ;;
   esac
-done
-
-for svc in "${STOPPED_SERVICES[@]}"; do
-  echo ">>> Starte $svc wieder"
-  systemctl start "$svc" || echo "WARNUNG: $svc konnte nicht neu gestartet werden – bitte manuell prüfen." >&2
 done
 
 # --- fstab im laufenden System anpassen ---
@@ -602,6 +612,7 @@ if ! findmnt --verify; then
   echo "FEHLER: 'findmnt --verify' hat Probleme in der neuen fstab gefunden." >&2
   echo "Bitte ${FSTAB} pruefen, bevor du 'mount -a' ausfuehrst oder neu startest." >&2
   echo "Die alte fstab liegt gesichert unter ${backup}." >&2
+  restart_stopped_services
   exit 1
 fi
 echo ">>> fstab-Validierung bestanden."
@@ -609,8 +620,17 @@ echo ">>> fstab-Validierung bestanden."
 echo
 if [[ $INCREMENTAL -eq 1 ]]; then
   echo ">>> Aktiviere die neuen Mounts sofort (kein Neustart nötig im inkrementellen Modus)"
-  systemctl daemon-reload
-  mount -a
+  if ! systemctl daemon-reload; then
+    echo "FEHLER: 'systemctl daemon-reload' ist fehlgeschlagen. Dienste werden wieder gestartet, soweit möglich." >&2
+    restart_stopped_services
+    exit 1
+  fi
+  if ! mount -a; then
+    echo "FEHLER: 'mount -a' ist fehlgeschlagen. Dienste werden wieder gestartet, soweit möglich." >&2
+    restart_stopped_services
+    exit 1
+  fi
+  restart_stopped_services
   echo ">>> FERTIG. Neue Subvolumes sind aktiv:"
   for entry in "${MAPS[@]}"; do
     findmnt -no TARGET,SOURCE,OPTIONS "${entry%%:*}" || true
@@ -623,6 +643,11 @@ else
   echo "Wenn keine Fehler kommen:"
   echo "  reboot"
   echo
+  if [[ ${#STOPPED_SERVICES[@]} -gt 0 ]]; then
+    echo "Folgende Dienste wurden für eine konsistente Kopie gestoppt und bleiben bis zum Reboot aus:"
+    printf '  %s\n' "${STOPPED_SERVICES[@]}"
+    echo
+  fi
   echo "Nach dem Reboot sollte / von subvol=@ und /home, /var/log, /var/lib/docker usw. von den jeweiligen Subvolumes kommen."
   echo "Die alte fstab liegt gesichert unter ${FSTAB}.backup-<Datum>."
 fi

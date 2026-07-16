@@ -17,8 +17,8 @@ Auf einem Debian- (oder Debian-basierten) System mit Btrfs-Root führt das Skrip
 - Prüft vorab den freien Speicherplatz (jedes Byte auf `/` wird während der Migration kurzzeitig dupliziert) und bricht ab, wenn es eng wird.
 - Erkennt eine schon (teilweise) durchgeführte Migration und wechselt automatisch in einen **inkrementellen Modus**: Läuft `/` bereits von einem benannten Subvolume, werden Root, GRUB und das Default-Subvolume nicht mehr angefasst — es werden nur noch fehlende Subvolumes für noch nicht separat gemountete Pfade ergänzt, sofort aktiv, ohne Neustart. Jeder Zielpfad wird einzeln klassifiziert: bereits korrekt eingerichtet (übersprungen, taucht im Auswahldialog gar nicht erst auf), anderweitig belegt (übersprungen mit Warnung, wird nicht überschrieben), oder noch offen (Kandidat für die Auswahl).
 - Fragt in einem interaktiven Terminal ausdrücklich nach ("ja" eintippen), bevor irgendetwas verändert wird — samt Warnhinweis, was das Skript tut und dass ein Fehlschlag das System unbootbar machen kann. Ohne Terminal (automatisierte Läufe) wird die Abfrage übersprungen.
-- Zeigt in einem interaktiven Terminal einen Auswahldialog (`whiptail`): universell sinnvolle Subvolumes (`@root`, `@home`, `@log`, `@cache`, `@tmp_var`, `@tmp`) sind vorausgewählt, alle vom Software-Stack abhängigen (Datenbanken, Docker/Podman, Webserver-Docroot) starten abgewählt — beides frei änderbar. Abgewählte Pfade bekommen kein eigenes Subvolume und bleiben einfach Teil von `@`. Ohne interaktives Terminal (z.B. bei automatisierter Ausführung) werden nur die universell sinnvollen Subvolumes ohne Nachfrage angelegt.
-- Stoppt bekannte Datenbank-, Datastore- und Container-Dienste vor deren Datenkopie, falls sie gerade laufen, und startet sie danach wieder — für eine konsistente Kopie statt halbgeschriebener Dateien.
+- Zeigt in einem interaktiven Terminal einen Auswahldialog (`whiptail`): universell sinnvolle Subvolumes (`@root`, `@home`, `@log`, `@cache`, `@tmp_var`, `@tmp`) sind vorausgewählt, alle vom Software-Stack abhängigen (Datenbanken, ClamAV, Docker/Podman, Webserver-Docroot) starten abgewählt — beides frei änderbar. Abgewählte Pfade bekommen kein eigenes Subvolume und bleiben einfach Teil von `@`. Ohne interaktives Terminal (z.B. bei automatisierter Ausführung) werden nur die universell sinnvollen Subvolumes ohne Nachfrage angelegt.
+- Stoppt bekannte Datenbank-, Datastore- und Container-Dienste vor deren Datenkopie, falls sie gerade laufen. Im inkrementellen Modus werden sie nach aktiven neuen Mounts neu gestartet; im initialen Migrationsmodus bleiben sie bis zum Reboot gestoppt — für eine konsistente Kopie statt halbgeschriebener Dateien.
 - Legt (idempotent) folgende Subvolumes an:
 
   - `@` (neues Root)
@@ -37,6 +37,7 @@ Auf einem Debian- (oder Debian-basierten) System mit Btrfs-Root führt das Skrip
   - `@mysql`
   - `@postgresql`
   - `@chroma`
+  - `@clamav`
   - `@stalwart`
   - `@elasticsearch`
   - `@opensearch`
@@ -67,6 +68,7 @@ Auf einem Debian- (oder Debian-basierten) System mit Btrfs-Root führt das Skrip
   - `/var/lib/mysql` → `@mysql`
   - `/var/lib/postgresql` → `@postgresql`
   - `/var/lib/chroma` → `@chroma`
+  - `/var/lib/clamav` → `@clamav`
   - `/var/lib/stalwart` → `@stalwart`
   - `/var/lib/elasticsearch` → `@elasticsearch`
   - `/var/lib/opensearch` → `@opensearch`
@@ -79,7 +81,7 @@ Auf einem Debian- (oder Debian-basierten) System mit Btrfs-Root führt das Skrip
   - `/var/lib/containers/storage/volumes` → `@containers-volumes`
   - `/var/www` → `@www`
 
-  Datenbank- und Datastore-Subvolumes (`@mongodb`, `@mysql`, `@postgresql`, `@chroma`, `@stalwart`, `@elasticsearch`, `@opensearch`, `@clickhouse`, `@cassandra`, `@couchdb`, `@neo4j`, `@rabbitmq`) sowie die benannten Docker-/Podman-Volumes (`@docker-volumes`, `@containers-volumes`) behalten normale Btrfs-Mounts mit CoW und Prüfsummen, bekommen aber vor der Datenkopie `btrfs property set ... compression no`. Damit verlässt sich das Skript nicht auf per-Subvolume gesetzte `compress`-/`nodatacow`-fstab-Optionen, die Btrfs für Mounts desselben Dateisystems nicht zuverlässig getrennt unterstützt. Image-Layer und Metadaten in `@docker`/`@containers` selbst bleiben auf der normalen komprimierten Policy.
+  Datenbank- und Datastore-Subvolumes (`@mongodb`, `@mysql`, `@postgresql`, `@chroma`, `@clamav`, `@stalwart`, `@elasticsearch`, `@opensearch`, `@clickhouse`, `@cassandra`, `@couchdb`, `@neo4j`, `@rabbitmq`) sowie die benannten Docker-/Podman-Volumes (`@docker-volumes`, `@containers-volumes`) behalten normale Btrfs-Mounts mit CoW und Prüfsummen, bekommen aber vor der Datenkopie `btrfs property set ... compression no`. Damit verlässt sich das Skript nicht auf per-Subvolume gesetzte `compress`-/`nodatacow`-fstab-Optionen, die Btrfs für Mounts desselben Dateisystems nicht zuverlässig getrennt unterstützt. Image-Layer und Metadaten in `@docker`/`@containers` selbst bleiben auf der normalen komprimierten Policy.
 
 - Bereitet im neuen Root (`@`) die Mountpoints vor, damit die Subvolumes dort eingehängt werden können.
 - Passt `/etc/fstab` im laufenden System an:
@@ -107,7 +109,7 @@ Das Ergebnis:
 - Debian oder Debian-basiertes System mit:
   - `apt`
   - `systemd`
-- Root-Dateisystem ist **Btrfs** auf einem einzelnen Device (z. B. eine Btrfs-Partition `/dev/vda2`).
+- Root-Dateisystem ist **Btrfs** auf einem einzelnen Device (z. B. eine Btrfs-Partition `/dev/vda2`); **LVM nicht** für das Root-Dateisystem aktivieren.
 - Das Skript wird als **root** ausgeführt.
 
 Bei Bedarf installiert das Skript automatisch:
@@ -115,9 +117,9 @@ Bei Bedarf installiert das Skript automatisch:
 - `rsync`
 - `btrfs-progs`
 
-> Am unkompliziertesten auf einer **frischen Server-Installation**, da dort alle Verzeichnisse klein/leer sind. Das Skript funktioniert aber auch auf bereits laufenden Systemen, **sofern genug freier Speicherplatz vorhanden ist** (wird automatisch geprüft – jedes Byte auf `/` wird während der Migration kurzzeitig dupliziert). Für eine konsistente Kopie werden bekannte Datenbank-, Datastore- und Container-Dienste vor ihrer jeweiligen Datenkopie automatisch gestoppt und danach wieder gestartet.
+> Am unkompliziertesten auf einer **frischen Server-Installation**, da dort alle Verzeichnisse klein/leer sind. Das Skript funktioniert aber auch auf bereits laufenden Systemen, **sofern genug freier Speicherplatz vorhanden ist** (wird automatisch geprüft – jedes Byte auf `/` wird während der Migration kurzzeitig dupliziert). Für eine konsistente Kopie werden bekannte Datenbank-, Datastore- und Container-Dienste vor ihrer jeweiligen Datenkopie automatisch gestoppt; im inkrementellen Modus nach `mount -a` neu gestartet und im initialen Migrationsmodus bis zum Reboot gestoppt gelassen.
 >
-> Trotzdem gilt auf laufenden Systemen: mach vorher ein Backup, plane ein Wartungsfenster für den abschließenden Neustart ein, und bedenke, dass Anwendungen **außerhalb** dieser Liste (z. B. Podman, ein eigener Webserver-Prozess mit offenen Dateien in `/srv` oder `/var/www`) während der Kopie weiterlaufen und dadurch theoretisch eine inkonsistente Momentaufnahme in ihr Subvolume bekommen könnten.
+> Trotzdem gilt auf laufenden Systemen: mach vorher ein Backup, plane ein Wartungsfenster für den abschließenden Neustart ein, und bedenke, dass Anwendungen **außerhalb** dieser Liste (z. B. ein eigener Webserver-Prozess mit offenen Dateien in `/srv` oder `/var/www`) während der Kopie weiterlaufen und dadurch theoretisch eine inkonsistente Momentaufnahme in ihr Subvolume bekommen könnten.
 
 ## Verwendung
 
@@ -125,6 +127,7 @@ Bei Bedarf installiert das Skript automatisch:
 
    - eine kleine EFI-Partition (z. B. `/dev/vda1`)
    - eine große Btrfs-Partition als Root (z. B. `/dev/vda2`)
+   - LVM für das Root-Dateisystem nicht ausgewählt/aktiviert ist
 
 2. Als root anmelden (oder `sudo` verwenden).
 
